@@ -143,6 +143,13 @@ export interface WSLLMOptions {
   strictToolSchema?: boolean;
   /** Specifies the processing tier (e.g. 'auto', 'default', 'priority', 'flex'). */
   serviceTier?: string;
+
+  /**
+   * OpenAI Conversations API conversation ID. When set, all responses are
+   * attached to this conversation and OpenAI automatically manages the full
+   * conversation context server-side.
+   */
+  conversation?: string;
 }
 
 const defaultLLMOptions: WSLLMOptions = {
@@ -268,6 +275,10 @@ export class WSLLM extends llm.LLM {
       modelOptions.metadata = this.#opts.metadata;
     }
 
+    if (this.#opts.conversation) {
+      modelOptions.conversation = this.#opts.conversation;
+    }
+
     if (this.#opts.serviceTier) {
       modelOptions.service_tier = this.#opts.serviceTier;
     }
@@ -275,8 +286,11 @@ export class WSLLM extends llm.LLM {
     let inputChatCtx = chatCtx;
     let prevResponseId: string | undefined;
     const canUseStoredResponse = modelOptions.store !== false;
+    const hasConversation = !!this.#opts.conversation;
 
-    if (canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
+    // Skip previous_response_id optimization when using the Conversations API —
+    // OpenAI manages the full history server-side via the conversation object.
+    if (!hasConversation && canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
       const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
       const lastPrevItemId = this.#prevChatCtx.items.at(-1)?.id ?? null;
 

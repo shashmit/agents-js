@@ -30,6 +30,13 @@ export interface LLMOptions {
   serviceTier?: string;
 
   /**
+   * OpenAI Conversations API conversation ID. When set, all responses are
+   * attached to this conversation and OpenAI automatically manages the full
+   * conversation context server-side — no need to send the full history each turn.
+   */
+  conversation?: string;
+
+  /**
    * Whether to use the WebSocket API.
    * @default true
    */
@@ -118,6 +125,10 @@ class ResponsesHttpLLM extends llm.LLM {
 
     if (this.#opts.serviceTier) {
       modelOptions.service_tier = this.#opts.serviceTier;
+    }
+
+    if (this.#opts.conversation) {
+      modelOptions.conversation = this.#opts.conversation;
     }
 
     return new ResponsesHttpLLMStream(this, {
