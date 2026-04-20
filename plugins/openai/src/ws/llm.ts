@@ -143,6 +143,13 @@ export interface WSLLMOptions {
   strictToolSchema?: boolean;
   /** Specifies the processing tier (e.g. 'auto', 'default', 'priority', 'flex'). */
   serviceTier?: string;
+
+  /**
+   * OpenAI Conversations API conversation ID. When set, all responses are
+   * attached to this conversation and OpenAI automatically manages the full
+   * conversation context server-side.
+   */
+  conversation?: string;
   /** Upper bound for the number of tokens that can be generated for a response. */
   maxOutputTokens?: number;
 }
@@ -270,6 +277,10 @@ export class WSLLM extends llm.LLM {
       modelOptions.metadata = this.#opts.metadata;
     }
 
+    if (this.#opts.conversation) {
+      modelOptions.conversation = this.#opts.conversation;
+    }
+
     if (this.#opts.serviceTier) {
       modelOptions.service_tier = this.#opts.serviceTier;
     }
@@ -281,8 +292,17 @@ export class WSLLM extends llm.LLM {
     let inputChatCtx = chatCtx;
     let prevResponseId: string | undefined;
     const canUseStoredResponse = modelOptions.store !== false;
+    const hasConversation = !!this.#opts.conversation;
 
-    if (canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
+    if (hasConversation && this.#prevChatCtx) {
+      // Conversations API retains prior turns server-side. Send only the
+      // incremental items added since the previous turn to avoid duplicating
+      // history and inflating token usage.
+      const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
+      const newItemIds = new Set(diff.toCreate.map(([, id]) => id));
+      const newItems = chatCtx.items.filter((item: llm.ChatItem) => newItemIds.has(item.id));
+      inputChatCtx = new llm.ChatContext(newItems);
+    } else if (!hasConversation && canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
       const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
       const lastPrevItemId = this.#prevChatCtx.items.at(-1)?.id ?? null;
 
@@ -311,7 +331,9 @@ export class WSLLM extends llm.LLM {
       pool: this.#pool,
       model: this.#opts.model,
       chatCtx: inputChatCtx,
-      fullChatCtx: chatCtx,
+      // In Conversations mode, the fallback context for retries must also be
+      // the incremental one — OpenAI already holds prior turns server-side.
+      fullChatCtx: hasConversation ? inputChatCtx : chatCtx,
       toolCtx,
       connOptions,
       modelOptions,
@@ -386,14 +408,34 @@ export class WSLLMStream extends llm.LLMStream {
 
     try {
       await this.#pool.withConnection(async (conn: ResponsesWebSocket) => {
-        const needsRetry = await this.#runWithConn(conn, this.chatCtx, this.#prevResponseId);
+        const missingToolOutputs: OpenAI.Responses.ResponseInputItem.FunctionCallOutput[] = [];
 
-        if (needsRetry) {
-          // previous_response_id was evicted from the server-side cache.
-          // Retry once on the same connection with the full context and no ID.
-          retryable = true;
-          await this.#runWithConn(conn, this.#fullChatCtx, undefined);
+        for (let attempt = 0; attempt < 4; attempt++) {
+          const result = await this.#runWithConn(
+            conn,
+            attempt === 0 ? this.chatCtx : this.#fullChatCtx,
+            attempt === 0 ? this.#prevResponseId : undefined,
+            missingToolOutputs,
+          );
+
+          if (result === false) {
+            return;
+          }
+
+          if (result === true) {
+            // previous_response_id was evicted from the server-side cache.
+            // Retry once on the same connection with the full context and no ID.
+            retryable = true;
+            continue;
+          }
+
+          missingToolOutputs.push(createInterruptedToolOutput(result));
         }
+
+        throw new APIStatusError({
+          message: 'OpenAI conversation has too many unresolved function calls to recover safely',
+          options: { statusCode: 400, retryable: false },
+        });
       });
     } catch (error) {
       if (
@@ -419,7 +461,8 @@ export class WSLLMStream extends llm.LLMStream {
     conn: ResponsesWebSocket,
     chatCtx: llm.ChatContext,
     prevResponseId: string | undefined,
-  ): Promise<boolean> {
+    extraInputItems: OpenAI.Responses.ResponseInputItem[] = [],
+  ): Promise<boolean | string> {
     const messages = (await chatCtx.toProviderFormat(
       'openai.responses',
     )) as OpenAI.Responses.ResponseInputItem[];
@@ -453,7 +496,7 @@ export class WSLLMStream extends llm.LLMStream {
     const payload: WsResponseCreateEvent = {
       type: 'response.create',
       model: this.#model as string,
-      input: messages as unknown[],
+      input: [...extraInputItems, ...(messages as unknown[])],
       tools: (tools ?? []) as unknown[],
       ...(prevResponseId ? { previous_response_id: prevResponseId } : {}),
       ...requestOptions,
@@ -484,6 +527,10 @@ export class WSLLMStream extends llm.LLMStream {
           case 'error': {
             const retry = this.#handleError(event, conn);
             if (retry) return true;
+            const missingToolCallId = getMissingToolCallId(event);
+            if (missingToolCallId && this.#modelOptions.conversation) {
+              return missingToolCallId;
+            }
             break;
           }
           case 'response.created':
@@ -527,6 +574,10 @@ export class WSLLMStream extends llm.LLMStream {
       // The server-side in-memory cache was evicted (e.g. after a failed turn
       // or reconnect). Signal the caller to retry with the full context.
       return true;
+    }
+
+    if (getMissingToolCallId(event) && this.#modelOptions.conversation) {
+      return false;
     }
 
     if (code === 'websocket_connection_limit_reached' || code === 'websocket_closed') {
@@ -609,6 +660,21 @@ export class WSLLMStream extends llm.LLMStream {
       options: { statusCode: -1, retryable: false },
     });
   }
+}
+
+function getMissingToolCallId(event: WsServerEvent & { type: 'error' }): string | null {
+  const message = event.error?.message ?? event.message ?? '';
+  return message.match(/No tool output found for function call (call_[A-Za-z0-9_-]+)/)?.[1] ?? null;
+}
+
+function createInterruptedToolOutput(
+  callId: string,
+): OpenAI.Responses.ResponseInputItem.FunctionCallOutput {
+  return {
+    type: 'function_call_output',
+    call_id: callId,
+    output: 'The previous tool call was interrupted before a result was returned.',
+  };
 }
 
 // ============================================================================

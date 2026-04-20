@@ -32,6 +32,13 @@ export interface LLMOptions {
   maxOutputTokens?: number;
 
   /**
+   * OpenAI Conversations API conversation ID. When set, all responses are
+   * attached to this conversation and OpenAI automatically manages the full
+   * conversation context server-side — no need to send the full history each turn.
+   */
+  conversation?: string;
+
+  /**
    * Whether to use the WebSocket API.
    * @default true
    */
@@ -50,6 +57,7 @@ const defaultLLMOptions: LLMOptions = {
 class ResponsesHttpLLM extends llm.LLM {
   #client: OpenAI;
   #opts: HttpLLMOptions;
+  #prevChatCtx: llm.ChatContext | null = null;
 
   constructor(opts: Partial<HttpLLMOptions> = defaultLLMOptions) {
     super();
@@ -122,6 +130,19 @@ class ResponsesHttpLLM extends llm.LLM {
       modelOptions.service_tier = this.#opts.serviceTier;
     }
 
+    if (this.#opts.conversation) {
+      modelOptions.conversation = this.#opts.conversation;
+    }
+
+    let inputChatCtx = chatCtx;
+    if (this.#opts.conversation && this.#prevChatCtx) {
+      // Conversations API retains prior turns server-side. Send only the
+      // incremental items added since the previous turn to avoid duplicating
+      // history and inflating token usage.
+      const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
+      const newItemIds = new Set(diff.toCreate.map(([, id]) => id));
+      const newItems = chatCtx.items.filter((item: llm.ChatItem) => newItemIds.has(item.id));
+      inputChatCtx = new llm.ChatContext(newItems);
     if (this.#opts.maxOutputTokens !== undefined) {
       modelOptions.max_output_tokens = this.#opts.maxOutputTokens;
     }
@@ -129,21 +150,28 @@ class ResponsesHttpLLM extends llm.LLM {
     return new ResponsesHttpLLMStream(this, {
       model: this.#opts.model,
       client: this.#client,
-      chatCtx,
+      chatCtx: inputChatCtx,
+      fullChatCtx: chatCtx,
       toolCtx,
       connOptions,
       modelOptions,
       strictToolSchema: this.#opts.strictToolSchema ?? true,
     });
   }
+
+  _onResponseCreated(chatCtx: llm.ChatContext): void {
+    this.#prevChatCtx = chatCtx;
+  }
 }
 
 class ResponsesHttpLLMStream extends llm.LLMStream {
+  private parentLLM: ResponsesHttpLLM;
   private model: string | ChatModels;
   private client: OpenAI;
   private modelOptions: Record<string, unknown>;
   private strictToolSchema: boolean;
   private responseId: string;
+  private fullChatCtx: llm.ChatContext;
 
   constructor(
     llm: ResponsesHttpLLM,
@@ -151,6 +179,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
       model,
       client,
       chatCtx,
+      fullChatCtx,
       toolCtx,
       connOptions,
       modelOptions,
@@ -159,6 +188,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
       model: string | ChatModels;
       client: OpenAI;
       chatCtx: llm.ChatContext;
+      fullChatCtx: llm.ChatContext;
       toolCtx?: llm.ToolContext;
       connOptions: APIConnectOptions;
       modelOptions: Record<string, unknown>;
@@ -166,11 +196,13 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
     },
   ) {
     super(llm, { chatCtx, toolCtx, connOptions });
+    this.parentLLM = llm;
     this.model = model;
     this.client = client;
     this.modelOptions = modelOptions;
     this.strictToolSchema = strictToolSchema;
     this.responseId = '';
+    this.fullChatCtx = fullChatCtx;
   }
 
   protected async run(): Promise<void> {
@@ -296,6 +328,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
 
   private handleResponseCreated(event: OpenAI.Responses.ResponseCreatedEvent): void {
     this.responseId = event.response.id;
+    this.parentLLM._onResponseCreated(this.fullChatCtx);
   }
 
   private handleResponseOutputItemDone(

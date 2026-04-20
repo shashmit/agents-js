@@ -14,6 +14,7 @@ export const wsResponseCreateEventSchema = z
     input: z.array(z.unknown()),
     tools: z.array(z.unknown()).optional(),
     previous_response_id: z.string().nullable().optional(),
+    conversation: z.string().optional(),
     store: z.boolean().optional(),
     temperature: z.number().optional(),
     metadata: z.record(z.string(), z.string()).optional(),
