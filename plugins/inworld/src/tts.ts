@@ -5,6 +5,7 @@ import {
   type APIConnectOptions,
   AudioByteStream,
   type TimedString,
+  asError,
   createTimedString,
   log,
   shortuuid,
@@ -193,7 +194,7 @@ class WSConnectionPool {
       try {
         return await this.#attemptConnection();
       } catch (err) {
-        lastError = err instanceof Error ? err : new Error(String(err));
+        lastError = asError(err);
         this.#connecting = undefined;
 
         if (attempt < MAX_RETRIES) {
@@ -584,12 +585,11 @@ class SynthesizeStream extends tts.SynthesizeStream {
             }
 
             // Create TimedString objects for the framework pipeline
-            // Add trailing space to each word for proper transcript rendering
             for (let i = 0; i < words.length; i++) {
               if (words[i] !== undefined && starts[i] !== undefined && ends[i] !== undefined) {
                 pendingTimedTranscripts.push(
                   createTimedString({
-                    text: words[i] + ' ',
+                    text: words[i]!,
                     startTime: starts[i],
                     endTime: ends[i],
                   }),

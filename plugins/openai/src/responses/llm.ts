@@ -28,6 +28,8 @@ export interface LLMOptions {
   strictToolSchema?: boolean;
   /** Specifies the processing tier (e.g. 'auto', 'default', 'priority', 'flex'). */
   serviceTier?: string;
+  /** Upper bound for the number of tokens that can be generated for a response. */
+  maxOutputTokens?: number;
 
   /**
    * OpenAI Conversations API conversation ID. When set, all responses are
@@ -141,6 +143,8 @@ class ResponsesHttpLLM extends llm.LLM {
       const newItemIds = new Set(diff.toCreate.map(([, id]) => id));
       const newItems = chatCtx.items.filter((item: llm.ChatItem) => newItemIds.has(item.id));
       inputChatCtx = new llm.ChatContext(newItems);
+    if (this.#opts.maxOutputTokens !== undefined) {
+      modelOptions.max_output_tokens = this.#opts.maxOutputTokens;
     }
 
     return new ResponsesHttpLLMStream(this, {
@@ -429,7 +433,6 @@ export class LLM extends llm.LLM {
     this.#llm.prewarm();
   }
 
-  // Ref: python livekit-plugins/livekit-plugins-openai/livekit/plugins/openai/responses/llm.py - 229-233 lines
   override async aclose(): Promise<void> {
     await this.#llm.aclose();
   }

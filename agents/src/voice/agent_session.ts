@@ -3,6 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import { Mutex } from '@livekit/mutex';
 import type { AudioFrame, Room } from '@livekit/rtc-node';
+import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { TypedEventEmitter as TypedEmitter } from '@livekit/typed-emitter';
 import type { Context, Span } from '@opentelemetry/api';
 import { ROOT_CONTEXT, context as otelContext, trace } from '@opentelemetry/api';
@@ -19,7 +20,7 @@ import {
 } from '../inference/index.js';
 import type { InterruptionDetectionError } from '../inference/interruption/errors.js';
 import type { OverlappingSpeechEvent } from '../inference/interruption/types.js';
-import { type JobContext, getJobContext } from '../job.js';
+import { getJobContext } from '../job.js';
 import type { FunctionCall, FunctionCallOutput } from '../llm/chat_context.js';
 import { AgentHandoffItem, ChatContext, ChatMessage } from '../llm/chat_context.js';
 import type { LLM, RealtimeModel, RealtimeModelError, ToolChoice } from '../llm/index.js';
@@ -36,7 +37,7 @@ import {
   type ResolvedSessionConnectOptions,
   type SessionConnectOptions,
 } from '../types.js';
-import { Task } from '../utils.js';
+import { Task, asError } from '../utils.js';
 import type { VAD } from '../vad.js';
 import type { Agent } from './agent.js';
 import {
@@ -102,7 +103,6 @@ export interface InternalSessionOptions<UserData> extends AgentSessionOptions<Us
 
 export const defaultAgentSessionOptions = {
   maxToolSteps: 3,
-  preemptiveGeneration: true,
   userAwayTimeout: 15.0,
   aecWarmupDuration: 3000,
   turnHandling: {},
@@ -112,7 +112,8 @@ export const defaultAgentSessionOptions = {
 /** @deprecated {@link VoiceOptions} has been flattened onto to {@link AgentSessionOptions} */
 export type VoiceOptions = {
   maxToolSteps: number;
-  preemptiveGeneration: boolean;
+  /** @deprecated Use {@link AgentSessionOptions.turnHandling}.preemptiveGeneration instead. */
+  preemptiveGeneration?: boolean;
   userAwayTimeout?: number | null;
   /** @deprecated Use {@link AgentSessionOptions.turnHandling}.interruption.mode instead. */
   allowInterruptions?: boolean;
@@ -159,12 +160,8 @@ export type AgentSessionOptions<UserData = UnknownUserData> = {
 
   maxToolSteps?: number;
   /**
-   * Whether to speculatively begin LLM and TTS requests before an end-of-turn is detected.
-   * When `true`, the agent sends inference calls as soon as a user transcript is received rather
-   * than waiting for a definitive turn boundary. This can reduce response latency by overlapping
-   * model inference with user audio, but may incur extra compute if the user interrupts or
-   * revises mid-utterance.
-   * @defaultValue true
+   * @deprecated Use `turnHandling.preemptiveGeneration` instead.
+   * When set, migrated into `turnHandling.preemptiveGeneration.enabled`.
    */
   preemptiveGeneration?: boolean;
 
@@ -446,12 +443,7 @@ export class AgentSession<
       }
     }
 
-    let ctx: JobContext | undefined = undefined;
-    try {
-      ctx = getJobContext();
-    } catch {
-      // JobContext is not available in evals
-    }
+    const ctx = getJobContext(false);
 
     if (ctx) {
       if (room && ctx.room === room && !room.isConnected) {
@@ -484,7 +476,7 @@ export class AgentSession<
     // Initial start does not wait on onEnter
     tasks.push(this._updateActivity(this.agent, { waitOnEnter: false }));
 
-    await Promise.allSettled(tasks);
+    await ThrowsPromise.allSettled(tasks);
 
     if (this.sessionHost) {
       await this.sessionHost.start();
@@ -524,10 +516,9 @@ export class AgentSession<
     this.closing = false;
     this._usageCollector = new ModelUsageCollector();
 
-    let ctx: JobContext | undefined = undefined;
-    try {
-      ctx = getJobContext();
+    const ctx = getJobContext(false);
 
+    if (ctx) {
       if (record === undefined) {
         record = ctx.job.enableRecording;
       }
@@ -537,9 +528,6 @@ export class AgentSession<
       if (this._enableRecording) {
         ctx.initRecording();
       }
-    } catch (error) {
-      // JobContext is not available in evals
-      this.logger.warn('JobContext is not available');
     }
 
     this.sessionSpan = tracer.startSpan({
@@ -657,6 +645,22 @@ export class AgentSession<
     return this.activity.interrupt(options);
   }
 
+  pauseReplyAuthorization(): void {
+    if (!this.activity) {
+      throw new Error('AgentSession is not running');
+    }
+
+    this.activity.pauseReplyAuthorization();
+  }
+
+  resumeReplyAuthorization(): void {
+    if (!this.activity) {
+      throw new Error('AgentSession is not running');
+    }
+
+    this.activity.resumeReplyAuthorization();
+  }
+
   generateReply(options?: {
     userInput?: string | ChatMessage;
     chatCtx?: ChatContext;
@@ -767,7 +771,7 @@ export class AgentSession<
         unlock();
         this.generateReply({ userInput });
       } catch (e) {
-        runState._reject(e instanceof Error ? e : new Error(String(e)));
+        runState._reject(asError(e));
       }
     })();
 

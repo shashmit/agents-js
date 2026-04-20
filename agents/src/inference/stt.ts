@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 import { type AudioFrame } from '@livekit/rtc-node';
+import { ThrowsPromise } from '@livekit/throws-transformer/throws';
 import type { WebSocket } from 'ws';
 import { APIError, APIStatusError } from '../_exceptions.js';
 import { AudioByteStream } from '../audio.js';
@@ -42,6 +43,8 @@ export type AssemblyaiModels =
 
 export type ElevenlabsSTTModels = 'elevenlabs/scribe_v2_realtime';
 
+export type XaiSTTModels = 'xai/stt-1';
+
 export interface CartesiaOptions {
   /** Minimum volume threshold. Default: not specified. */
   min_volume?: number;
@@ -70,6 +73,10 @@ export interface DeepgramOptions {
   numerals?: boolean;
   /** Opt out of model improvement program. */
   mip_opt_out?: boolean;
+  /** Enable speaker diarization. Default: false. */
+  diarize?: boolean;
+  /** Eager end-of-turn threshold (0.0–1.0). Enables preflight transcripts for preemptive generation. */
+  eager_eot_threshold?: number;
 }
 
 export interface AssemblyAIOptions {
@@ -83,6 +90,19 @@ export interface AssemblyAIOptions {
   max_turn_silence?: number;
   /** Key terms prompt for recognition. Default: not specified. */
   keyterms_prompt?: string[];
+  /** Enable speaker diarization. Default: false. */
+  speaker_labels?: boolean;
+}
+
+export interface XaiOptions {
+  /** Enable speaker diarization. Default: false. */
+  diarize?: boolean;
+  /** Silence duration in ms before utterance-final (0-5000). */
+  endpointing?: number;
+  /** Enable Inverse Text Normalization. Requires language. */
+  format?: boolean;
+  /** Default true; set false to opt out of interim transcripts. */
+  interim_results?: boolean;
 }
 
 export type STTLanguages =
@@ -97,7 +117,19 @@ export type STTLanguages =
   | 'hi'
   | AnyString;
 
-type _STTModels = DeepgramModels | CartesiaModels | AssemblyaiModels | ElevenlabsSTTModels;
+const DIARIZATION_EXTRA_KEYS = ['diarize', 'speaker_labels'] as const;
+
+function diarizationEnabled(extraKwargs: Record<string, unknown> | undefined): boolean {
+  if (!extraKwargs) return false;
+  return DIARIZATION_EXTRA_KEYS.some((key) => Boolean(extraKwargs[key]));
+}
+
+type _STTModels =
+  | DeepgramModels
+  | CartesiaModels
+  | AssemblyaiModels
+  | ElevenlabsSTTModels
+  | XaiSTTModels;
 
 export type STTModels = _STTModels | 'auto' | AnyString;
 
@@ -109,7 +141,9 @@ export type STTOptions<TModel extends STTModels> = TModel extends DeepgramModels
     ? CartesiaOptions
     : TModel extends AssemblyaiModels
       ? AssemblyAIOptions
-      : Record<string, unknown>;
+      : TModel extends XaiSTTModels
+        ? XaiOptions
+        : Record<string, unknown>;
 
 /** A fallback model with optional extra configuration. Extra fields are passed through to the provider. */
 export interface STTFallbackModel {
@@ -188,7 +222,13 @@ export class STT<TModel extends STTModels> extends BaseSTT {
     fallback?: STTFallbackModelType | STTFallbackModelType[];
     connOptions?: APIConnectOptions;
   }) {
-    super({ streaming: true, interimResults: true, alignedTranscript: 'word' });
+    const modelOptions = (opts?.modelOptions ?? {}) as STTOptions<TModel>;
+    super({
+      streaming: true,
+      interimResults: true,
+      alignedTranscript: 'word',
+      diarization: diarizationEnabled(modelOptions as Record<string, unknown>),
+    });
 
     const {
       model,
@@ -198,7 +238,6 @@ export class STT<TModel extends STTModels> extends BaseSTT {
       sampleRate = DEFAULT_SAMPLE_RATE,
       apiKey,
       apiSecret,
-      modelOptions = {} as STTOptions<TModel>,
       fallback,
       connOptions,
     } = opts || {};
@@ -269,12 +308,25 @@ export class STT<TModel extends STTModels> extends BaseSTT {
     throw new Error('LiveKit STT does not support batch recognition, use stream() instead');
   }
 
-  updateOptions(opts: Partial<Pick<InferenceSTTOptions<TModel>, 'model' | 'language'>>): void {
+  updateOptions(
+    opts: Partial<Pick<InferenceSTTOptions<TModel>, 'model' | 'language' | 'modelOptions'>>,
+  ): void {
+    const mergedModelOptions = opts.modelOptions
+      ? ({ ...this.opts.modelOptions, ...opts.modelOptions } as STTOptions<TModel>)
+      : this.opts.modelOptions;
+
     this.opts = {
       ...this.opts,
       ...opts,
       language: opts.language !== undefined ? normalizeLanguage(opts.language) : this.opts.language,
+      modelOptions: mergedModelOptions,
     };
+
+    if (opts.modelOptions) {
+      this.updateCapabilities({
+        diarization: diarizationEnabled(this.opts.modelOptions as Record<string, unknown>),
+      });
+    }
 
     for (const stream of this.streams) {
       stream.updateOptions(opts);
@@ -374,11 +426,18 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
     return 'inference.SpeechStream';
   }
 
-  updateOptions(opts: Partial<Pick<InferenceSTTOptions<TModel>, 'model' | 'language'>>): void {
+  updateOptions(
+    opts: Partial<Pick<InferenceSTTOptions<TModel>, 'model' | 'language' | 'modelOptions'>>,
+  ): void {
+    const mergedModelOptions = opts.modelOptions
+      ? ({ ...this.opts.modelOptions, ...opts.modelOptions } as STTOptions<TModel>)
+      : this.opts.modelOptions;
+
     this.opts = {
       ...this.opts,
       ...opts,
       language: opts.language !== undefined ? normalizeLanguage(opts.language) : this.opts.language,
+      modelOptions: mergedModelOptions,
     };
     this.reconnectEvent.set();
   }
@@ -401,7 +460,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
       };
 
       const createWsListener = async (ws: WebSocket, signal: AbortSignal) => {
-        return new Promise<void>((resolve, reject) => {
+        return new ThrowsPromise<void, Error | APIStatusError>((resolve, reject) => {
           const onAbort = () => {
             resourceCleanup();
             reject(new Error('WebSocket connection aborted'));
@@ -444,7 +503,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
         );
 
         // Create abort promise once to avoid memory leak
-        const abortPromise = new Promise<never>((_, reject) => {
+        const abortPromise = new ThrowsPromise<never, Error>((_, reject) => {
           if (signal.aborted) {
             return reject(new Error('Send aborted'));
           }
@@ -456,7 +515,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
         const iterator = this.input[Symbol.asyncIterator]();
         try {
           while (true) {
-            const result = await Promise.race([iterator.next(), abortPromise]);
+            const result = await ThrowsPromise.race([iterator.next(), abortPromise]);
 
             if (result.done) break;
             const ev = result.value;
@@ -519,10 +578,13 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
                 resourceCleanup();
                 break;
               case 'interim_transcript':
-                this.processTranscript(event, false);
+                this.processTranscript(event, SpeechEventType.INTERIM_TRANSCRIPT);
                 break;
               case 'final_transcript':
-                this.processTranscript(event, true);
+                this.processTranscript(event, SpeechEventType.FINAL_TRANSCRIPT);
+                break;
+              case 'preflight_transcript':
+                this.processTranscript(event, SpeechEventType.PREFLIGHT_TRANSCRIPT);
                 break;
               case 'error':
                 this.#logger.error({ error: event }, 'Received error from LiveKit STT');
@@ -555,13 +617,13 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
         );
         const recvTask = Task.from(({ signal }) => recv(signal), connController);
         const waitReconnectTask = Task.from(
-          ({ signal }) => Promise.race([this.reconnectEvent.wait(), waitForAbort(signal)]),
+          ({ signal }) => ThrowsPromise.race([this.reconnectEvent.wait(), waitForAbort(signal)]),
           connController,
         );
 
         try {
-          await Promise.race([
-            Promise.all([sendTask.result, wsListenerTask.result, recvTask.result]),
+          await ThrowsPromise.race([
+            ThrowsPromise.all([sendTask.result, wsListenerTask.result, recvTask.result]),
             waitReconnectTask.result,
           ]);
 
@@ -588,7 +650,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
     }
   }
 
-  private processTranscript(data: SttTranscriptEvent, isFinal: boolean) {
+  private processTranscript(data: SttTranscriptEvent, eventType: SpeechEventType) {
     // Check if queue is closed to avoid race condition during disconnect
     if (this.queue.closed) return;
 
@@ -596,7 +658,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
     const text = data.transcript;
     const language = normalizeLanguage(data.language || this.opts.language || 'en');
 
-    if (!text && !isFinal) return;
+    if (!text && eventType !== SpeechEventType.FINAL_TRANSCRIPT) return;
 
     try {
       // We'll have a more accurate way of detecting when speech started when we have VAD
@@ -611,6 +673,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
         endTime: this.startTimeOffset + data.start + data.duration,
         confidence: data.confidence,
         text,
+        speakerId: data.speaker_id ?? undefined,
         words: data.words.map(
           (word): TimedString =>
             createTimedString({
@@ -619,11 +682,12 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
               endTime: word.end + this.startTimeOffset,
               startTimeOffset: this.startTimeOffset,
               confidence: word.confidence,
+              speakerId: word.speaker_id ?? undefined,
             }),
         ),
       };
 
-      if (isFinal) {
+      if (eventType === SpeechEventType.FINAL_TRANSCRIPT) {
         if (this.speechDuration > 0) {
           this.queue.put({
             type: SpeechEventType.RECOGNITION_USAGE,
@@ -645,7 +709,7 @@ export class SpeechStream<TModel extends STTModels> extends BaseSpeechStream {
         }
       } else {
         this.queue.put({
-          type: SpeechEventType.INTERIM_TRANSCRIPT,
+          type: eventType,
           requestId,
           alternatives: [speechData],
         });
