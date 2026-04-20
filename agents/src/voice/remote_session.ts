@@ -725,14 +725,6 @@ export class SessionHost {
         });
       case 'getSessionUsage':
         return this.handleGetSessionUsage(req.requestId);
-      case 'getFrameworkInfo':
-        return this.sendResponse(req.requestId, {
-          case: 'getFrameworkInfo',
-          value: new pb.SessionResponse_GetFrameworkInfoResponse({
-            sdk: 'js',
-            sdkVersion: version,
-          }),
-        });
     }
   }
 

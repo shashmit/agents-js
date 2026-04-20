@@ -288,9 +288,15 @@ export class WSLLM extends llm.LLM {
     const canUseStoredResponse = modelOptions.store !== false;
     const hasConversation = !!this.#opts.conversation;
 
-    // Skip previous_response_id optimization when using the Conversations API —
-    // OpenAI manages the full history server-side via the conversation object.
-    if (!hasConversation && canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
+    if (hasConversation && this.#prevChatCtx) {
+      // Conversations API retains prior turns server-side. Send only the
+      // incremental items added since the previous turn to avoid duplicating
+      // history and inflating token usage.
+      const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
+      const newItemIds = new Set(diff.toCreate.map(([, id]) => id));
+      const newItems = chatCtx.items.filter((item: llm.ChatItem) => newItemIds.has(item.id));
+      inputChatCtx = new llm.ChatContext(newItems);
+    } else if (!hasConversation && canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
       const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
       const lastPrevItemId = this.#prevChatCtx.items.at(-1)?.id ?? null;
 
@@ -319,7 +325,9 @@ export class WSLLM extends llm.LLM {
       pool: this.#pool,
       model: this.#opts.model,
       chatCtx: inputChatCtx,
-      fullChatCtx: chatCtx,
+      // In Conversations mode, the fallback context for retries must also be
+      // the incremental one — OpenAI already holds prior turns server-side.
+      fullChatCtx: hasConversation ? inputChatCtx : chatCtx,
       toolCtx,
       connOptions,
       modelOptions,
