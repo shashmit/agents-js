@@ -335,3 +335,91 @@ if (hasOpenAIApiKey) {
     it.skip('requires OPENAI_API_KEY', () => {});
   });
 }
+
+describe('OpenAI Responses WS conversation mode', () => {
+  /** Answers each response.create with the next scripted frame sequence. */
+  class ScriptedConnection {
+    payloads: WsResponseCreateEvent[] = [];
+
+    constructor(private readonly scripts: WsServerEvent[][]) {}
+
+    sendRequest(payload: WsResponseCreateEvent): stream.StreamChannel<WsServerEvent> {
+      const frames = this.scripts[this.payloads.length] ?? [];
+      this.payloads.push(payload);
+      const channel = stream.createStreamChannel<WsServerEvent>();
+      void (async () => {
+        for (const frame of frames) await channel.write(frame);
+        await channel.close();
+      })();
+      return channel;
+    }
+
+    close(): void {}
+  }
+
+  const completed = (text: string): WsServerEvent[] => [
+    RESPONSE_CREATED,
+    { type: 'response.output_text.delta', delta: text },
+    { type: 'response.completed', response: { id: 'resp_1' } },
+  ];
+
+  async function runTurn(model: WSLLM, conn: ScriptedConnection, chatCtx: ChatContext) {
+    // route the stream through the scripted connection instead of a real socket
+    const pool = new ConnectionPool<ResponsesWebSocket>({
+      connectCb: async () => conn as unknown as ResponsesWebSocket,
+    });
+    vi.spyOn(ConnectionPool.prototype, 'withConnection').mockImplementationOnce((fn) =>
+      pool.withConnection(fn as never),
+    );
+    let text = '';
+    for await (const chunk of model.chat({ chatCtx })) text += chunk.delta?.content ?? '';
+    await pool.close();
+    return text;
+  }
+
+  it('sends only new items with conversation and instructions, never previous_response_id', async () => {
+    const model = new WSLLM({ model: 'gpt-4.1', apiKey: 'test-key', conversation: 'conv_1' });
+    const conn = new ScriptedConnection([completed('Hello!'), completed('Sure.')]);
+    const chatCtx = ChatContext.empty();
+    chatCtx.addMessage({ role: 'system', content: 'Be brief.' });
+    chatCtx.addMessage({ role: 'user', content: 'hi' });
+
+    expect(await runTurn(model, conn, chatCtx)).toBe('Hello!');
+    chatCtx.addMessage({ role: 'assistant', content: 'Hello!' });
+    chatCtx.addMessage({ role: 'user', content: 'help me' });
+    await runTurn(model, conn, chatCtx);
+
+    for (const payload of conn.payloads) {
+      expect(payload.conversation).toBe('conv_1');
+      expect(payload.instructions).toBe('Be brief.');
+      expect(payload).not.toHaveProperty('previous_response_id');
+    }
+    expect(conn.payloads[0]!.input).toEqual([{ role: 'user', content: 'hi' }]);
+    expect(conn.payloads[1]!.input).toEqual([{ role: 'user', content: 'help me' }]);
+    await model.aclose();
+  });
+
+  it('answers a call the server reports as missing an output and resends', async () => {
+    const model = new WSLLM({ model: 'gpt-4.1', apiKey: 'test-key', conversation: 'conv_1' });
+    const missingOutput: WsServerEvent = {
+      type: 'error',
+      status: 400,
+      error: { message: 'No tool output found for function call call_stale.' },
+    };
+    const conn = new ScriptedConnection([[missingOutput], completed('Back again.')]);
+    const chatCtx = ChatContext.empty();
+    chatCtx.addMessage({ role: 'user', content: 'hi' });
+
+    expect(await runTurn(model, conn, chatCtx)).toBe('Back again.');
+    expect(conn.payloads).toHaveLength(2);
+    expect(conn.payloads[1]!.input).toEqual([
+      {
+        type: 'function_call_output',
+        call_id: 'call_stale',
+        output: 'The tool call was interrupted before a result was returned.',
+      },
+      { role: 'user', content: 'hi' },
+    ]);
+    await model.aclose();
+  });
+});

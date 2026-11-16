@@ -15,7 +15,13 @@ import OpenAI from 'openai';
 import type { ChatModels, Reasoning } from '../models.js';
 import { defaultReasoningEffort } from '../models.js';
 import { toResponsesTools } from '../tool_utils.js';
-import { WSLLM } from '../ws/llm.js';
+import { WSLLM, joinInstructions } from '../ws/llm.js';
+import {
+  ConversationState,
+  type ConversationTurn,
+  MAX_TOOL_OUTPUT_RECOVERIES,
+  parseMissingToolOutputCallId,
+} from './conversation.js';
 
 export interface LLMOptions {
   model: string | ChatModels;
@@ -34,6 +40,13 @@ export interface LLMOptions {
   maxOutputTokens?: number;
   /** Configuration options for reasoning models. */
   reasoning?: Reasoning | null;
+  /**
+   * OpenAI Conversations API conversation ID. When set, every response is stored in this
+   * conversation and OpenAI supplies the prior turns server-side, so each request only carries
+   * the items the conversation does not hold yet. System instructions are sent through the
+   * request's `instructions` field so they are not persisted into the conversation.
+   */
+  conversation?: string;
 
   /**
    * Whether to use the WebSocket API.
@@ -54,6 +67,7 @@ const defaultLLMOptions: LLMOptions = {
 class ResponsesHttpLLM extends llm.LLM {
   #client: OpenAI;
   #opts: HttpLLMOptions;
+  #conversation?: ConversationState;
 
   constructor(opts: Partial<HttpLLMOptions> = defaultLLMOptions) {
     super();
@@ -64,6 +78,10 @@ class ResponsesHttpLLM extends llm.LLM {
       if (effort !== undefined) {
         this.#opts.reasoning = { effort };
       }
+    }
+
+    if (this.#opts.conversation) {
+      this.#conversation = new ConversationState(this.#opts.conversation);
     }
 
     if (this.#opts.apiKey === undefined && this.#opts.client === undefined) {
@@ -147,6 +165,18 @@ class ResponsesHttpLLM extends llm.LLM {
       modelOptions.reasoning = this.#opts.reasoning;
     }
 
+    let conversationTurn: ConversationTurn | undefined;
+    if (this.#conversation) {
+      conversationTurn = this.#conversation.beginTurn(chatCtx);
+      modelOptions.conversation = conversationTurn.conversationId;
+      if (conversationTurn.instructions) {
+        modelOptions.instructions = joinInstructions(
+          modelOptions.instructions,
+          conversationTurn.instructions,
+        );
+      }
+    }
+
     return new ResponsesHttpLLMStream(this, {
       model: this.#opts.model,
       client: this.#client,
@@ -155,6 +185,7 @@ class ResponsesHttpLLM extends llm.LLM {
       connOptions,
       modelOptions,
       strictToolSchema: this.#opts.strictToolSchema ?? true,
+      conversationTurn,
     });
   }
 }
@@ -165,6 +196,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
   private modelOptions: Record<string, unknown>;
   private strictToolSchema: boolean;
   private responseId: string;
+  private conversationTurn?: ConversationTurn;
 
   constructor(
     llm: ResponsesHttpLLM,
@@ -176,6 +208,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
       connOptions,
       modelOptions,
       strictToolSchema,
+      conversationTurn,
     }: {
       model: string | ChatModels;
       client: OpenAI;
@@ -184,6 +217,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
       connOptions: APIConnectOptions;
       modelOptions: Record<string, unknown>;
       strictToolSchema: boolean;
+      conversationTurn?: ConversationTurn;
     },
   ) {
     super(llm, { chatCtx, toolCtx, connOptions });
@@ -192,16 +226,13 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
     this.modelOptions = modelOptions;
     this.strictToolSchema = strictToolSchema;
     this.responseId = '';
+    this.conversationTurn = conversationTurn;
   }
 
   protected async run(): Promise<void> {
     let retryable = true;
 
     try {
-      const messages = (await this.chatCtx.toProviderFormat(
-        'openai.responses',
-      )) as OpenAI.Responses.ResponseInputItem[];
-
       // TODO: support provider tools in the Responses schema.
       const tools = this.toolCtx
         ? toResponsesTools(this.toolCtx, this.strictToolSchema)
@@ -212,18 +243,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
         delete requestOptions.tool_choice;
       }
 
-      const stream = await this.client.responses.create(
-        {
-          model: this.model,
-          input: messages,
-          tools: tools,
-          stream: true,
-          ...requestOptions,
-        },
-        {
-          timeout: this.connOptions.timeoutMs,
-        },
-      );
+      const stream = await this.createResponse(tools, requestOptions);
 
       for await (const event of stream) {
         let chunk: llm.ChatChunk | undefined;
@@ -289,6 +309,44 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
     }
   }
 
+  /**
+   * Opens the response stream. In Conversations mode, a request rejected because the
+   * conversation holds a function call without an output is patched and resent.
+   */
+  private async createResponse(
+    tools: OpenAI.Responses.Tool[] | undefined,
+    requestOptions: Record<string, unknown>,
+  ) {
+    for (let attempt = 0; ; attempt++) {
+      this.conversationTurn?.resetOutput();
+      const input = this.conversationTurn
+        ? await this.conversationTurn.toInput()
+        : ((await this.chatCtx.toProviderFormat(
+            'openai.responses',
+          )) as OpenAI.Responses.ResponseInputItem[]);
+
+      try {
+        return await this.client.responses.create(
+          { model: this.model, input, tools, stream: true, ...requestOptions },
+          { timeout: this.connOptions.timeoutMs },
+        );
+      } catch (error) {
+        const missingToolCallId =
+          error instanceof OpenAI.BadRequestError
+            ? parseMissingToolOutputCallId(error.message)
+            : undefined;
+        if (
+          attempt < MAX_TOOL_OUTPUT_RECOVERIES &&
+          missingToolCallId &&
+          this.conversationTurn?.recoverMissingToolOutput(missingToolCallId)
+        ) {
+          continue;
+        }
+        throw error;
+      }
+    }
+  }
+
   private handleError(event: OpenAI.Responses.ResponseErrorEvent): void {
     throw new APIStatusError({
       message: event.message,
@@ -323,6 +381,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
     let chunk: llm.ChatChunk | undefined;
 
     if (event.item.type === 'function_call') {
+      this.conversationTurn?.recordFunctionCall(event.item.call_id);
       chunk = {
         id: this.responseId,
         delta: {
@@ -357,6 +416,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
   private handleResponseOutputTextDelta(
     event: OpenAI.Responses.ResponseTextDeltaEvent,
   ): llm.ChatChunk {
+    this.conversationTurn?.recordText(event.delta);
     return {
       id: this.responseId,
       delta: {
@@ -369,6 +429,7 @@ class ResponsesHttpLLMStream extends llm.LLMStream {
   private handleResponseCompleted(
     event: OpenAI.Responses.ResponseCompletedEvent,
   ): llm.ChatChunk | undefined {
+    this.conversationTurn?.commit();
     if (event.response.usage) {
       return {
         id: this.responseId,

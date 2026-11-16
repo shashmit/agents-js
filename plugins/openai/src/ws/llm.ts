@@ -16,6 +16,12 @@ import type OpenAI from 'openai';
 import { WebSocket } from 'ws';
 import type { ChatModels, Reasoning } from '../models.js';
 import { defaultReasoningEffort } from '../models.js';
+import {
+  ConversationState,
+  type ConversationTurn,
+  MAX_TOOL_OUTPUT_RECOVERIES,
+  parseMissingToolOutputCallId,
+} from '../responses/conversation.js';
 import { toResponsesTools } from '../tool_utils.js';
 import type {
   WsOutputItemDoneEvent,
@@ -179,6 +185,14 @@ export interface WSLLMOptions {
   maxOutputTokens?: number;
   /** Configuration options for reasoning models. */
   reasoning?: Reasoning | null;
+  /**
+   * OpenAI Conversations API conversation ID. When set, every response is stored in this
+   * conversation and OpenAI supplies the prior turns server-side, so each request only carries
+   * the items the conversation does not hold yet. System instructions are sent through the
+   * request's `instructions` field so they are not persisted into the conversation.
+   * Mutually exclusive with `previous_response_id` chaining.
+   */
+  conversation?: string;
 }
 
 const defaultLLMOptions: WSLLMOptions = {
@@ -197,6 +211,7 @@ export class WSLLM extends llm.LLM {
   #prevResponseId = '';
   #prevChatCtx: llm.ChatContext | null = null;
   #pendingToolCalls = new Set<string>();
+  #conversation?: ConversationState;
 
   /**
    * Create a new instance of the OpenAI Responses API WebSocket LLM.
@@ -218,6 +233,10 @@ export class WSLLM extends llm.LLM {
       if (effort !== undefined) {
         this.#opts.reasoning = { effort };
       }
+    }
+
+    if (this.#opts.conversation) {
+      this.#conversation = new ConversationState(this.#opts.conversation);
     }
 
     if (!this.#opts.apiKey) {
@@ -329,8 +348,19 @@ export class WSLLM extends llm.LLM {
     let inputChatCtx = chatCtx;
     let prevResponseId: string | undefined;
     const canUseStoredResponse = modelOptions.store !== false;
+    let conversationTurn: ConversationTurn | undefined;
 
-    if (canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
+    if (this.#conversation) {
+      // The conversation holds prior turns server-side; previous_response_id must not be sent.
+      conversationTurn = this.#conversation.beginTurn(chatCtx);
+      modelOptions.conversation = conversationTurn.conversationId;
+      if (conversationTurn.instructions) {
+        modelOptions.instructions = joinInstructions(
+          modelOptions.instructions,
+          conversationTurn.instructions,
+        );
+      }
+    } else if (canUseStoredResponse && this.#prevChatCtx && this.#prevResponseId) {
       const diff = llm.computeChatCtxDiff(this.#prevChatCtx, chatCtx);
       const lastPrevItemId = this.#prevChatCtx.items.at(-1)?.id ?? null;
 
@@ -366,6 +396,7 @@ export class WSLLM extends llm.LLM {
       modelOptions,
       prevResponseId,
       strictToolSchema: this.#opts.strictToolSchema ?? true,
+      conversationTurn,
     });
   }
 
@@ -401,6 +432,8 @@ export class WSLLMStream extends llm.LLMStream {
    * that reads chunks sits in #runWithConn, one call down from run().
    */
   #retryable = true;
+  /** Set in Conversations API mode; owns the request input and tracks what the server stored. */
+  #conversationTurn?: ConversationTurn;
 
   constructor(
     llm: WSLLM,
@@ -414,6 +447,7 @@ export class WSLLMStream extends llm.LLMStream {
       modelOptions,
       prevResponseId,
       strictToolSchema,
+      conversationTurn,
     }: {
       pool: ConnectionPool<ResponsesWebSocket>;
       model: string | ChatModels;
@@ -424,6 +458,7 @@ export class WSLLMStream extends llm.LLMStream {
       modelOptions: Record<string, unknown>;
       prevResponseId?: string;
       strictToolSchema: boolean;
+      conversationTurn?: ConversationTurn;
     },
   ) {
     super(llm, { chatCtx, toolCtx, connOptions });
@@ -434,6 +469,7 @@ export class WSLLMStream extends llm.LLMStream {
     this.#strictToolSchema = strictToolSchema;
     this.#prevResponseId = prevResponseId;
     this.#fullChatCtx = fullChatCtx;
+    this.#conversationTurn = conversationTurn;
   }
 
   protected async run(): Promise<void> {
@@ -442,7 +478,17 @@ export class WSLLMStream extends llm.LLMStream {
 
     try {
       await this.#pool.withConnection(async (conn: ResponsesWebSocket) => {
-        const result = await this.#runWithConn(conn, this.chatCtx, this.#prevResponseId);
+        let result = await this.#runWithConn(conn, this.chatCtx, this.#prevResponseId);
+
+        if (this.#conversationTurn) {
+          // `true` here means a missing tool output was patched into the turn; resend it.
+          for (let i = 0; result === true && i < MAX_TOOL_OUTPUT_RECOVERIES; i++) {
+            this.#retryable = true;
+            result = await this.#runWithConn(conn, this.chatCtx, undefined);
+          }
+          if (result instanceof APIStatusError) responseError = result;
+          return;
+        }
 
         if (result instanceof APIStatusError) {
           responseError = result;
@@ -477,17 +523,20 @@ export class WSLLMStream extends llm.LLMStream {
 
   /**
    * Execute a single response.create round-trip on the given connection.
-   * Returns `true` when the caller should retry with the full chat context
-   * (i.e. `previous_response_not_found`), `false` otherwise.
+   * Returns `true` when the caller should retry: with the full chat context after
+   * `previous_response_not_found`, or with the patched turn in Conversations mode.
    */
   async #runWithConn(
     conn: ResponsesWebSocket,
     chatCtx: llm.ChatContext,
     prevResponseId: string | undefined,
   ): Promise<boolean | APIStatusError> {
-    const messages = (await chatCtx.toProviderFormat(
-      'openai.responses',
-    )) as OpenAI.Responses.ResponseInputItem[];
+    this.#conversationTurn?.resetOutput();
+    const messages = this.#conversationTurn
+      ? await this.#conversationTurn.toInput()
+      : ((await chatCtx.toProviderFormat(
+          'openai.responses',
+        )) as OpenAI.Responses.ResponseInputItem[]);
 
     const tools = this.toolCtx ? toResponsesTools(this.toolCtx, this.#strictToolSchema) : undefined;
 
@@ -580,6 +629,13 @@ export class WSLLMStream extends llm.LLMStream {
       return true;
     }
 
+    const missingToolCallId = parseMissingToolOutputCallId(event.error?.message ?? event.message);
+    if (missingToolCallId && this.#conversationTurn?.recoverMissingToolOutput(missingToolCallId)) {
+      // The conversation holds a function call with no output (e.g. left by an earlier agent
+      // process). Answer it with a placeholder and resend; nothing has reached the caller yet.
+      return true;
+    }
+
     if (code === 'websocket_connection_limit_reached' || code === 'websocket_closed') {
       // Transient connection issue (timeout, network drop, or 60-min limit).
       // Evict this connection so the pool opens a fresh one on retry.
@@ -607,6 +663,7 @@ export class WSLLMStream extends llm.LLMStream {
   #handleOutputItemDone(event: WsOutputItemDoneEvent): llm.ChatChunk | undefined {
     if (event.item.type === 'function_call') {
       this.#pendingToolCalls.add(event.item.call_id);
+      this.#conversationTurn?.recordFunctionCall(event.item.call_id);
       return {
         id: this.#responseId,
         delta: {
@@ -635,6 +692,7 @@ export class WSLLMStream extends llm.LLMStream {
   }
 
   #handleOutputTextDelta(event: WsOutputTextDeltaEvent): llm.ChatChunk {
+    this.#conversationTurn?.recordText(event.delta);
     return {
       id: this.#responseId,
       delta: {
@@ -645,8 +703,12 @@ export class WSLLMStream extends llm.LLMStream {
   }
 
   #handleResponseCompleted(event: WsResponseCompletedEvent): llm.ChatChunk | undefined {
-    this.#llm._onResponseCompleted(event.response.id, this.#fullChatCtx);
-    this.#llm._setPendingToolCalls(this.#pendingToolCalls);
+    if (this.#conversationTurn) {
+      this.#conversationTurn.commit();
+    } else {
+      this.#llm._onResponseCompleted(event.response.id, this.#fullChatCtx);
+      this.#llm._setPendingToolCalls(this.#pendingToolCalls);
+    }
 
     if (event.response.usage) {
       return {
@@ -681,6 +743,11 @@ export class WSLLMStream extends llm.LLMStream {
 // ============================================================================
 // Internal helpers
 // ============================================================================
+
+/** Combines caller-supplied `instructions` (e.g. via extraKwargs) with the chat context's. */
+export function joinInstructions(existing: unknown, instructions: string): string {
+  return typeof existing === 'string' && existing ? `${existing}\n\n${instructions}` : instructions;
+}
 
 async function connectWs(url: string, apiKey: string, timeoutMs: number): Promise<WebSocket> {
   return new Promise<WebSocket>((resolve, reject) => {
